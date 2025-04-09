@@ -1,0 +1,56 @@
+% Read election results
+election2024 = readtable('2024_US_County_Level_Presidential_Results.csv');
+
+% Check what columns exist
+head(election2024)
+
+%%
+
+% Load shapefile
+counties = readgeotable('cb_2020_us_county_20m.shp');
+
+% Convert GEOID to numeric for matching
+counties.FIPS = str2double(counties.GEOID);
+
+%%
+% Load election data
+election = readtable('election2024_simplified.csv');
+
+% Load shapefile (download and unzip if needed)
+states = shaperead('cb_2020_us_county_20m.shp', 'UseGeoCoords', true);
+
+% Create the map
+figure;
+ax = usamap('all');
+set(ax, 'Visible', 'off');
+
+% Loop through each county
+for i = 1:length(states)
+    fips = str2double(states(i).GEOID);
+    idx = find(election.county_fips == fips);
+
+    % Default color = gray
+    color = [0.85 0.85 0.85];
+
+    if ~isempty(idx)
+        margin = election.per_point_diff(idx);
+
+        if isnan(margin)
+            color = [0.85 0.85 0.85]; % gray
+        elseif margin > 0
+            % Red for GOP win
+            color = [1, 0.2, 0.2] * min(margin, 1);
+        else
+            % Blue for Dem win
+            color = [0.2, 0.2, 1] * min(abs(margin), 1);
+        end
+    end
+
+    % Draw the county with assigned color
+    geoshow(states(i).Lat, states(i).Lon, ...
+        'DisplayType', 'polygon', ...
+        'FaceColor', color, ...
+        'EdgeColor', 'none');
+end
+
+title('2024 Presidential Election Results by County');
