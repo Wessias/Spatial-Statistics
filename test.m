@@ -823,7 +823,7 @@ for i = 1:length(methods)
     resid_values = pred.(methods{i});
     coords_pred = [pred.Lon, pred.Lat];
 
-z    % Remove NaNs
+    % Remove NaNs
     valid = ~isnan(resid_values);
     resid_values = resid_values(valid);
     coords_pred = coords_pred(valid, :);
