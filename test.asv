@@ -2,7 +2,7 @@
 election2024 = readtable('2024_US_County_Level_Presidential_Results.csv');
 
 % Check what columns exist
-head(election2024)
+%head(election2024);
 
 %%
 
@@ -12,45 +12,698 @@ counties = readgeotable('cb_2020_us_county_20m.shp');
 % Convert GEOID to numeric for matching
 counties.FIPS = str2double(counties.GEOID);
 
-%%
-% Load election data
-election = readtable('election2024_simplified.csv');
 
-% Load shapefile (download and unzip if needed)
+
+%%
+
+% Load election data
+election = readtable('election2024_WI_IL_IA.csv');
+
+% Load shapefile (make sure it's unzipped and in your folder, you need all the files)
 states = shaperead('cb_2020_us_county_20m.shp', 'UseGeoCoords', true);
 
-% Create the map
+% Filter for WI (55), IL (17), IA (19)
+state_fps = {'55', '17', '19'};
+regionStates = states(ismember({states.STATEFP}, state_fps));
+
+% Preallocate arrays
+n = length(regionStates);
+centroids = zeros(n, 2); % [Lon, Lat]
+geoids = zeros(n, 1);
+
+for i = 1:n
+    lon = regionStates(i).Lon;
+    lat = regionStates(i).Lat;
+    lon = lon(~isnan(lon));  % Remove NaNs
+    lat = lat(~isnan(lat));
+    centroids(i, :) = [mean(lon), mean(lat)];
+    geoids(i) = str2double(regionStates(i).GEOID);
+end
+
+% Create table with centroid and vote margin
+centroidT = table(geoids, centroids(:,1), centroids(:,2), ...
+                  'VariableNames', {'county_fips', 'Lon', 'Lat'});
+
+% Merge with vote margin
+merged = innerjoin(election, centroidT, 'Keys', 'county_fips');
+
+popData = readtable("county_population_density_full.csv");
+
+% Ensure county_fips is formatted as a string with leading zeros
+merged.county_fips = string(merged.county_fips);
+popData.county_fips = string(popData.county_fips);
+
+popDensityOnly = popData(:, {'county_fips', 'pop_density'});
+
+
+% Join on county_fips
+merged = innerjoin(merged, popDensityOnly, "Keys", "county_fips", "RightVariables","pop_density");
+
+%% START WITH THE KRIGING
+
+rng(42); % reproducible
+percentile = 0.2;
+n = height(merged);
+idx_sample = randperm(n, round(percentile * n));
+obs = merged(idx_sample, :);
+pred = merged(setdiff(1:n, idx_sample), :);
+
+coords_obs = [obs.Lon, obs.Lat];
+values_obs = obs.per_point_diff;
+
+% Compute empirical variogram
+vstruct = variogram(coords_obs, values_obs, 'nrbins', 15);
+
+d = vstruct.distance;
+gamma = vstruct.val;
+
+
+% Fit spherical model
+[a,c,n,model] = variogramfit(d, gamma, max(d)/2, var(values_obs), [], 'model', 'gaussian');
+
+%Nugget gives [] sometimes
+if isempty(model.nugget)
+    model.nugget = min(model.gamma - model.gammahat);  % estimate from fit residuals
+end
+
+
+coords_pred = [pred.Lon, pred.Lat];
+
+% Run Kriging
+Zhat = ordinary_kriging_manual(coords_obs, values_obs, coords_pred, model);
+
+% Save predictions
+pred.ok_pred = Zhat;
+
+rmse_ok = sqrt(mean((pred.ok_pred - pred.per_point_diff).^2));
+fprintf('Ordinary Kriging RMSE (Gaussian): %.2f\n', rmse_ok);
+
+%% Plot Ordinary Kriging (fast)
+
+% Custom blue-to-black-to-red colormap
+n = 256;
+half = floor(n / 2);
+
+% Blue to black
+blue_black = [linspace(0, 0, half)', linspace(0, 0, half)', linspace(1, 0, half)'];
+
+% Black to red
+black_red = [linspace(0, 1, half)', linspace(0, 0, half)', linspace(0, 0, half)'];
+
+% Combine into one map
+custom_cmap = [blue_black; black_red];
+
+
+% Define the region of interest
+lon_range = linspace(min(merged.Lon), max(merged.Lon), 100);
+lat_range = linspace(min(merged.Lat), max(merged.Lat), 100);
+[LonGrid, LatGrid] = meshgrid(lon_range, lat_range);
+
+
+
+% Convert to [n x 2] coordinate list
+grid_coords = [LonGrid(:), LatGrid(:)];
+
+% Predict vote margins across the grid
+Zgrid = ordinary_kriging_manual(coords_obs, values_obs, grid_coords, model);
+
+% Reshape to match the grid
+Zgrid = reshape(Zgrid, size(LonGrid));
+
+% Plot interpolated surface
 figure;
-ax = usamap('all');
+contourf(LonGrid, LatGrid, Zgrid, 50, 'LineColor', 'none');
+colormap(custom_cmap);
+colorbar;
+clim([-1 1]);  % lock color scale to vote margin range
+hold on;
+
+% Overlay observed points
+scatter(obs.Lon, obs.Lat, 40, obs.per_point_diff, 'filled', ...
+        'MarkerEdgeColor', 'k');
+title('Ordinary Kriging: Vote Margin');
+xlabel('Longitude'); ylabel('Latitude');
+axis equal;
+
+
+
+%
+%variogramfit(d, gamma, max(d)/2, var(values_obs), 0, 'model', 'spherical');
+%variogramfit(d, gamma, max(d)/2, var(values_obs), 0, 'model', 'gaussian');
+%variogramfit(d, gamma, max(d)/2, var(values_obs), 0, 'model', 'exponential');
+%legend('Empirical')
+
+
+%% Ordinary kriging plotting (slow with borders and stuff)
+figure;
+ax = usamap({'wisconsin', 'illinois', 'iowa'});
 set(ax, 'Visible', 'off');
 
-% Loop through each county
-for i = 1:length(states)
-    fips = str2double(states(i).GEOID);
+% Custom colormap: red to black to blue
+ncolors = 256;
+half = floor(ncolors / 2);
+blue_black = [linspace(0, 0, half)', linspace(0, 0, half)', linspace(1, 0, half)'];
+black_red = [linspace(0, 1, half)', linspace(0, 0, half)', linspace(0, 0, half)'];
+custom_cmap = [blue_black; black_red];
+colormap(ax, custom_cmap);
+clim([-1, 1]);
+colorbar;
+
+% Loop through counties
+for i = 1:length(regionStates)
+    fips = str2double(regionStates(i).GEOID);
+
+    % Check if county was sampled (in obs) or predicted (in pred)
+    idx_obs = find(obs.county_fips == fips);
+    idx_pred = find(pred.county_fips == fips);
+
+    % Default
+    color = [0.85, 0.85, 0.85];
+    edge = 'none';
+    edgeW = 0.1;
+
+    if ~isempty(idx_obs)
+        % Sampled: use actual observed margin
+        margin = obs.per_point_diff(idx_obs);
+        % Soft contrast for small margins using sqrt scaling
+        scaled_margin = sign(margin) .* sqrt(abs(margin));
+
+% Clamp to [-1, 1] in case sqrt made it small
+        scaled_margin = max(min(scaled_margin, 1), -1);
+        edge = [0.5, 0.5, 0.5];
+        edgeW = 1;
+    elseif ~isempty(idx_pred)
+        % Not sampled: use predicted margin
+        margin = pred.ok_pred(idx_pred);
+        % Soft contrast for small margins using sqrt scaling
+        scaled_margin = sign(margin) .* sqrt(abs(margin));
+
+% Clamp to [-1, 1] in case sqrt made it small
+        scaled_margin = max(min(scaled_margin, 1), -1);
+    else
+        margin = NaN;
+    end
+
+    % Assign color based on margin
+    if isnan(scaled_margin)
+        color = [0.85, 0.85, 0.85];
+    elseif margin > 0
+        color = [1, 0, 0] * min(scaled_margin, 1);
+    elseif margin < 0
+        color = [0, 0, 1] * min(abs(scaled_margin), 1);
+    else
+        color = [0, 0, 0];
+    end
+
+    % Plot county
+    geoshow(regionStates(i).Lat, regionStates(i).Lon, ...
+        'DisplayType', 'polygon', ...
+        'FaceColor', color, ...
+        'EdgeColor', edge, ...
+        'LineWidth', edgeW);
+end
+
+
+title('Kriging Predicted Margins with Observed Counties (True Values)');
+
+%% Ordinary Kriging vs real values plot (y=x)
+
+figure;
+scatter(pred.per_point_diff, pred.ok_pred, 60, 'filled');
+xlabel('True Vote Margin');
+ylabel('Kriging Predicted Vote Margin');
+title('Ordinary Kriging: Predicted vs Actual Margins');
+grid on;
+axis equal;
+xlim([-1 1]);
+ylim([-1 1]);
+refline(1, 0);  % 1:1 line
+
+
+%% Ordinary kriging vs real margins, map side by side
+% Create figure with 2 subplots
+figure;
+tiledlayout(1,2, 'Padding', 'compact', 'TileSpacing', 'compact');
+
+% Custom red-black-blue colormap
+ncolors = 256;
+half = floor(ncolors / 2);
+blue_black = [linspace(0, 0, half)', linspace(0, 0, half)', linspace(1, 0, half)'];
+black_red = [linspace(0, 1, half)', linspace(0, 0, half)', linspace(0, 0, half)'];
+custom_cmap = [blue_black; black_red];
+
+% ========== 1. TRUE MARGINS ==========
+nexttile;
+ax1 = usamap({'wisconsin','illinois','iowa'});
+set(ax1, 'Visible', 'off');
+colormap(ax1, custom_cmap);
+clim([-1 1]);
+
+for i = 1:length(regionStates)
+    fips = str2double(regionStates(i).GEOID);
     idx = find(election.county_fips == fips);
 
-    % Default color = gray
+    color = [0.85 0.85 0.85];
+    edge = 'none';
+    edgeW = 0.1;
+
+    if ~isempty(idx)
+        margin = election.per_point_diff(idx);
+        scaled_margin = sign(margin) .* sqrt(abs(margin));
+
+% Clamp to [-1, 1] in case sqrt made it small
+        scaled_margin = max(min(scaled_margin, 1), -1);
+        
+        if ~isnan(scaled_margin)
+            if scaled_margin > 0
+                color = [1, 0, 0] * min(scaled_margin, 1);
+            elseif scaled_margin < 0
+                color = [0, 0, 1] * min(abs(scaled_margin), 1);
+            else
+                color = [0, 0, 0];
+            end
+        end
+    end
+
+    % Show outline for sampled counties
+    if any(obs.county_fips == fips)
+        edge = [0.5 0.5 0.5];
+        edgeW = 1.2;
+    end
+
+    geoshow(regionStates(i).Lat, regionStates(i).Lon, ...
+        'DisplayType', 'polygon', ...
+        'FaceColor', color, ...
+        'EdgeColor', edge, ...
+        'LineWidth', edgeW);
+end
+title('Actual Vote Margins (Sampled Counties Outlined)');
+
+% ========== 2. KRIGED MARGINS ==========
+nexttile;
+ax2 = usamap({'wisconsin','illinois','iowa'});
+set(ax2, 'Visible', 'off');
+colormap(ax2, custom_cmap);
+clim([-1 1]);
+
+for i = 1:length(regionStates)
+    fips = str2double(regionStates(i).GEOID);
+    idx_obs = find(obs.county_fips == fips);
+    idx_pred = find(pred.county_fips == fips);
+
+    color = [0.85 0.85 0.85];
+    edge = 'none';
+    edgeW = 0.1;
+
+    if ~isempty(idx_obs)
+        margin = obs.per_point_diff(idx_obs);
+        scaled_margin = sign(margin) .* sqrt(abs(margin));
+
+% Clamp to [-1, 1] in case sqrt made it small
+        scaled_margin = max(min(scaled_margin, 1), -1);
+        edge = [0.5, 0.5, 0.5];
+        edgeW = 1.2;
+    elseif ~isempty(idx_pred)
+        margin = pred.ok_pred(idx_pred);
+        scaled_margin = sign(margin) .* sqrt(abs(margin));
+
+% Clamp to [-1, 1] in case sqrt made it small
+        scaled_margin = max(min(scaled_margin, 1), -1);
+    else
+        scaled_margin = NaN;
+    end
+
+    if ~isnan(scaled_margin)
+        if scaled_margin > 0
+            color = [1, 0, 0] * min(scaled_margin, 1);
+        elseif margin < 0
+            color = [0, 0, 1] * min(abs(scaled_margin), 1);
+        else
+            color = [0, 0, 0];
+        end
+    end
+
+    geoshow(regionStates(i).Lat, regionStates(i).Lon, ...
+        'DisplayType', 'polygon', ...
+        'FaceColor', color, ...
+        'EdgeColor', edge, ...
+        'LineWidth', edgeW);
+end
+title('Ordinary Kriging Predicted Margins');
+
+
+%%
+% Side-by-side map of actual vs kriged margins
+figure;
+tiledlayout(1,2, 'Padding', 'compact', 'TileSpacing', 'compact');
+
+% Choose a colormap (try redbluecmap from File Exchange or any built-in one)
+% colormapName = redbluecmap(256); % if installed
+colormapName = jet(256); % or parula, coolwarm, turbo (R2023b+)
+climRange = [-1 1];
+
+% ===== 1. ACTUAL VOTE MARGINS =====
+nexttile;
+ax1 = usamap({'wisconsin','illinois','iowa'});
+set(ax1, 'Visible', 'off');
+colormap(ax1, colormapName);
+caxis(climRange);
+
+for i = 1:length(regionStates)
+    fips = str2double(regionStates(i).GEOID);
+    idx = find(election.county_fips == fips);
+
+    color = [0.85 0.85 0.85]; % default
+    edge = 'none';
+    edgeW = 0.1;
+
+    if ~isempty(idx)
+        margin = election.per_point_diff(idx);
+        if ~isnan(margin)
+            color = interp1(linspace(climRange(1), climRange(2), size(colormapName,1)), ...
+                            colormapName, margin, 'linear', 'extrap');
+        end
+    end
+
+    if any(obs.county_fips == fips)
+        edge = [0.5 0.5 0.5];
+        edgeW = 1.2;
+    end
+
+    geoshow(regionStates(i).Lat, regionStates(i).Lon, ...
+        'DisplayType', 'polygon', ...
+        'FaceColor', color, ...
+        'EdgeColor', edge, ...
+        'LineWidth', edgeW);
+end
+title('Actual Vote Margins');
+
+% ===== 2. ORDINARY KRIGING MARGINS =====
+nexttile;
+ax2 = usamap({'wisconsin','illinois','iowa'});
+set(ax2, 'Visible', 'off');
+colormap(ax2, colormapName);
+caxis(climRange);
+
+for i = 1:length(regionStates)
+    fips = str2double(regionStates(i).GEOID);
+    idx_obs = find(obs.county_fips == fips);
+    idx_pred = find(pred.county_fips == fips);
+
+    color = [0.85 0.85 0.85]; % default
+    edge = 'none';
+    edgeW = 0.1;
+
+    if ~isempty(idx_obs)
+        margin = obs.per_point_diff(idx_obs);
+        edge = [0.5 0.5 0.5];
+        edgeW = 1.2;
+    elseif ~isempty(idx_pred)
+        margin = pred.ok_pred(idx_pred);
+    else
+        margin = NaN;
+    end
+
+    if ~isnan(margin)
+        color = interp1(linspace(climRange(1), climRange(2), size(colormapName,1)), ...
+                        colormapName, margin, 'linear', 'extrap');
+    end
+
+    geoshow(regionStates(i).Lat, regionStates(i).Lon, ...
+        'DisplayType', 'polygon', ...
+        'FaceColor', color, ...
+        'EdgeColor', edge, ...
+        'LineWidth', edgeW);
+end
+colorbar;
+title('Ordinary Kriging Predicted Margins');
+
+
+
+
+
+
+
+
+
+
+
+%% Universal Kriging using only position
+
+%Linear regression to fit trend parameters for 
+% Z(s) = beta_0 + beta_1 *Lon(s) + beta_2 * Lat(s) + eps(s)
+
+X_obs = [obs.Lon, obs.Lat];  % Predictors
+y_obs = obs.per_point_diff;  % Target
+
+trend_model = fitlm(X_obs, y_obs);
+
+X_pred = [pred.Lon, pred.Lat];
+trend_pred = predict(trend_model, X_pred);
+
+residuals_obs = y_obs - predict(trend_model, X_obs);
+
+% Compute variogram of residuals
+vstruct = variogram(X_obs, residuals_obs, 'nrbins', 15);
+d = vstruct.distance;
+gamma = vstruct.val;
+
+% Fit variogram model (e.g., Gaussian)
+[~, ~, ~, model] = variogramfit(d, gamma, max(d)/2, var(residuals_obs), [], 'model', 'gaussian');
+if isempty(model.nugget)
+    model.nugget = 0.001;  % fallback
+end
+
+Zresid_pred = ordinary_kriging_manual(X_obs, residuals_obs, X_pred, model);
+
+Zuk_pred = trend_pred + Zresid_pred;
+pred.uk_pred = Zuk_pred;
+
+rmse_uk = sqrt(mean((pred.per_point_diff - pred.uk_pred).^2));
+fprintf('Universal Kriging RMSE: %.3f\n', rmse_uk);
+
+
+
+%% 
+% Create figure with 3 subplots
+figure;
+tiledlayout(1,3, 'Padding', 'compact', 'TileSpacing', 'compact');
+
+% Colormap settings
+colormapName = jet(256); % or any preferred MATLAB colormap
+climRange = [-1, 1];
+
+% ============================
+% 1. TRUE MARGINS
+% ============================
+nexttile;
+ax1 = usamap({'wisconsin','illinois','iowa'});
+set(ax1, 'Visible', 'off');
+colormap(ax1, colormapName);
+caxis(climRange);
+
+for i = 1:length(regionStates)
+    fips = str2double(regionStates(i).GEOID);
+    idx = find(election.county_fips == fips);
+
+    color = [0.85 0.85 0.85];
+    edge = 'none'; edgeW = 0.1;
+
+    if ~isempty(idx)
+        margin = election.per_point_diff(idx);
+        if ~isnan(margin)
+            color = interp1(linspace(climRange(1), climRange(2), size(colormapName,1)), ...
+                            colormapName, margin, 'linear', 'extrap');
+        end
+    end
+
+    if any(obs.county_fips == fips)
+        edge = [0.5 0.5 0.5];
+        edgeW = 1.2;
+    end
+
+    geoshow(regionStates(i).Lat, regionStates(i).Lon, ...
+        'DisplayType', 'polygon', ...
+        'FaceColor', color, ...
+        'EdgeColor', edge, ...
+        'LineWidth', edgeW);
+end
+title('Actual Vote Margins');
+
+% ============================
+% 2. ORDINARY KRIGING
+% ============================
+nexttile;
+ax2 = usamap({'wisconsin','illinois','iowa'});
+set(ax2, 'Visible', 'off');
+colormap(ax2, colormapName);
+caxis(climRange);
+
+for i = 1:length(regionStates)
+    fips = str2double(regionStates(i).GEOID);
+    idx_obs = find(obs.county_fips == fips);
+    idx_pred = find(pred.county_fips == fips);
+
+    color = [0.85 0.85 0.85]; edge = 'none'; edgeW = 0.1;
+
+    if ~isempty(idx_obs)
+        margin = obs.per_point_diff(idx_obs);
+        edge = [0.5 0.5 0.5]; edgeW = 1.2;
+    elseif ~isempty(idx_pred)
+        margin = pred.ok_pred(idx_pred);
+    else
+        margin = NaN;
+    end
+
+    if ~isnan(margin)
+        color = interp1(linspace(climRange(1), climRange(2), size(colormapName,1)), ...
+                        colormapName, margin, 'linear', 'extrap');
+    end
+
+    geoshow(regionStates(i).Lat, regionStates(i).Lon, ...
+        'DisplayType', 'polygon', ...
+        'FaceColor', color, ...
+        'EdgeColor', edge, ...
+        'LineWidth', edgeW);
+end
+title('Ordinary Kriging Prediction');
+
+% ============================
+% 3. UNIVERSAL KRIGING
+% ============================
+nexttile;
+ax3 = usamap({'wisconsin','illinois','iowa'});
+set(ax3, 'Visible', 'off');
+colormap(ax3, colormapName);
+caxis(climRange);
+
+for i = 1:length(regionStates)
+    fips = str2double(regionStates(i).GEOID);
+    idx_obs = find(obs.county_fips == fips);
+    idx_pred = find(pred.county_fips == fips);
+
+    color = [0.85 0.85 0.85]; edge = 'none'; edgeW = 0.1;
+
+    if ~isempty(idx_obs)
+        margin = obs.per_point_diff(idx_obs);  % Show true for sampled
+        edge = [0.5 0.5 0.5]; edgeW = 1.2;
+    elseif ~isempty(idx_pred)
+        margin = pred.uk_pred(idx_pred);       % Show predicted for others
+    else
+        margin = NaN;
+    end
+
+    if ~isnan(margin)
+        color = interp1(linspace(climRange(1), climRange(2), size(colormapName,1)), ...
+                        colormapName, margin, 'linear', 'extrap');
+    end
+
+    geoshow(regionStates(i).Lat, regionStates(i).Lon, ...
+        'DisplayType', 'polygon', ...
+        'FaceColor', color, ...
+        'EdgeColor', edge, ...
+        'LineWidth', edgeW);
+end
+colorbar;
+title('Universal Kriging Prediction');
+
+
+%%
+
+
+figure;
+hold on;
+scatter(pred.per_point_diff, pred.uk_pred, 60, 'filled');
+scatter(pred.per_point_diff, pred.ok_pred, 60);
+hold off;
+xlabel('True Vote Margin');
+ylabel('Kriging Predicted Vote Margin');
+title('OK and UK: Predicted vs Actual Margins');
+grid on;
+axis equal;
+xlim([-1 1]);
+ylim([-1 1]);
+refline(1, 0);  % 1:1 line
+
+
+
+
+
+
+
+
+
+
+
+
+%% Universal kriging using position and population density
+
+X_obs = [obs.Lon, obs.Lat, obs.pop_density];
+y_obs = obs.per_point_diff;
+
+trend_model = fitlm(X_obs, y_obs);
+
+X_pred = [pred.Lon, pred.Lat, pred.pop_density];
+trend_pred = predict(trend_model, X_pred);
+
+residuals_obs = y_obs - predict(trend_model, X_obs);
+
+
+vstruct = variogram(X_obs(:,1:2), residuals_obs, 'nrbins', 15);
+d = vstruct.distance;
+gamma = vstruct.val;
+
+[~, ~, ~, model] = variogramfit(d, gamma, max(d)/2, var(residuals_obs), [], 'model', 'gaussian');
+if isempty(model.nugget), model.nugget = 0.001; end
+
+
+Zresid_pred = ordinary_kriging_manual(X_obs(:,1:2), residuals_obs, X_pred(:,1:2), model);
+
+
+Zuk_pred = trend_pred + Zresid_pred;
+pred.uk_pred = Zuk_pred;
+
+
+
+
+
+%%
+
+
+
+
+% Set up the map (bounds can be adjusted)
+figure;
+ax = usamap({'wisconsin', 'illinois', 'iowa'});
+set(ax, 'Visible', 'off');
+
+% Loop through each county and color based on margin
+for i = 1:length(regionStates)
+    fips = str2double(regionStates(i).GEOID);
+    idx = find(election.county_fips == fips);
+
+    % Default gray color
     color = [0.85 0.85 0.85];
 
     if ~isempty(idx)
         margin = election.per_point_diff(idx);
 
         if isnan(margin)
-            color = [0.85 0.85 0.85]; % gray
+            color = [0.85 0.85 0.85]; % neutral
         elseif margin > 0
-            % Red for GOP win
+            % GOP win (red, intensity based on margin)
             color = [1, 0.2, 0.2] * min(margin, 1);
         else
-            % Blue for Dem win
+            % Dem win (blue, intensity based on margin)
             color = [0.2, 0.2, 1] * min(abs(margin), 1);
         end
     end
 
-    % Draw the county with assigned color
-    geoshow(states(i).Lat, states(i).Lon, ...
+    % Draw county with selected color
+    geoshow(regionStates(i).Lat, regionStates(i).Lon, ...
         'DisplayType', 'polygon', ...
         'FaceColor', color, ...
         'EdgeColor', 'none');
 end
 
-title('2024 Presidential Election Results by County');
+title('2024 Presidential Election Vote Margins by County - WI, IL, IA');
