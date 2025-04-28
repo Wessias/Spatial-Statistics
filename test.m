@@ -59,6 +59,18 @@ popDensityOnly = popData(:, {'county_fips', 'pop_density'});
 % Join on county_fips
 merged = innerjoin(merged, popDensityOnly, "Keys", "county_fips", "RightVariables","pop_density");
 
+% Load the covariate data
+covData = readtable('county_covariates_final.csv');
+
+% Make sure FIPS codes are strings
+merged.county_fips = string(merged.county_fips);
+covData.FIPS = string(covData.FIPS);
+
+% Perform inner join to keep only matching counties
+merged = innerjoin(merged, covData, 'LeftKeys', 'county_fips', 'RightKeys', 'FIPS');
+
+
+
 merged.county_fips = double(merged.county_fips);
 
 %% START WITH THE KRIGING
@@ -668,6 +680,77 @@ pred.uk_pred = Zuk_pred;
 rmse_uk = sqrt(mean((pred.per_point_diff - pred.uk_pred).^2));
 fprintf('Universal Kriging RMSE (with pop_density): %.3f\n', rmse_uk);
 
+%%
+
+%% Universal kriging using position and population density
+
+X_obs = [obs.Lon, obs.Lat, obs.pop_density];
+y_obs = obs.per_point_diff;
+
+trend_model = fitlm(X_obs, y_obs);
+
+X_pred = [pred.Lon, pred.Lat, pred.pop_density];
+trend_pred = predict(trend_model, X_pred);
+
+residuals_obs = y_obs - predict(trend_model, X_obs);
+
+
+vstruct = variogram(X_obs(:,1:2), residuals_obs, 'nrbins', 15);
+d = vstruct.distance;
+gamma = vstruct.val;
+
+[~, ~, ~, model] = variogramfit(d, gamma, max(d)/2, var(residuals_obs), [], 'model', 'gaussian');
+if isempty(model.nugget), model.nugget = 0.001; end
+
+
+Zresid_pred = ordinary_kriging_manual(X_obs(:,1:2), residuals_obs, X_pred(:,1:2), model);
+
+
+Zuk_pred = trend_pred + Zresid_pred;
+pred.uk_pred = Zuk_pred;
+
+rmse_uk = sqrt(mean((pred.per_point_diff - pred.uk_pred).^2));
+fprintf('Universal Kriging RMSE (with pop_density): %.3f\n', rmse_uk);
+
+
+
+%% ALEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEX
+% BELOW IS CODE TO TEST WITH DIFFERENT COVARIATES
+
+%% Universal Kriging with covariates
+% Double check with column names in merged
+covariates_to_use = {'pop_density', 'Some_College', 'Unemployment', 'VoterTurnout', 'Child_Care_Cost_Burden','Severe_Housing_Cost_Burden', 'High_School_Grad'};
+
+%pred = full_kriging_model(merged, obs, pred, covariates_to_use, true, model); % with GLS
+pred = full_kriging_model(merged, obs, pred, covariates_to_use, false, model); % with OLS (fitlm)
+
+% True margins vs predicted margins
+true_vals = pred.per_point_diff;
+pred_vals = pred.kriging_pred;
+
+% Calculate RMSE
+rmse_final = sqrt(mean((true_vals - pred_vals).^2, 'omitnan'));
+
+fprintf('Full Model RMSE: %.4f\n', rmse_final);
+
+
+
+%% Plot universal kriging with covariates
+% Create a side-by-side layout
+figure;
+t = tiledlayout(1,2,'TileSpacing','compact','Padding','compact');
+
+% Plot true margins
+nexttile;
+plot_margin_map(regionStates, election, obs, pred, 'per_point_diff', 'True Vote Margins');
+caxis([-1,1]);
+
+% Plot full kriging prediction
+nexttile;
+plot_margin_map(regionStates, election, obs, pred, 'kriging_pred', 'Full Model Kriging Prediction');
+caxis([-1,1]);
+
+colorbar;
 
 
 %% Kriging with external drift

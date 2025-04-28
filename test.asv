@@ -59,6 +59,20 @@ popDensityOnly = popData(:, {'county_fips', 'pop_density'});
 % Join on county_fips
 merged = innerjoin(merged, popDensityOnly, "Keys", "county_fips", "RightVariables","pop_density");
 
+% Load the covariate data
+covData = readtable('county_covariates_final.csv');
+
+% Make sure FIPS codes are strings
+merged.county_fips = string(merged.county_fips);
+covData.FIPS = string(covData.FIPS);
+
+% Perform inner join to keep only matching counties
+merged = innerjoin(merged, covData, 'LeftKeys', 'county_fips', 'RightKeys', 'FIPS');
+
+
+
+merged.county_fips = double(merged.county_fips);
+
 %% START WITH THE KRIGING
 
 rng(42); % reproducible
@@ -662,6 +676,255 @@ Zresid_pred = ordinary_kriging_manual(X_obs(:,1:2), residuals_obs, X_pred(:,1:2)
 
 Zuk_pred = trend_pred + Zresid_pred;
 pred.uk_pred = Zuk_pred;
+
+rmse_uk = sqrt(mean((pred.per_point_diff - pred.uk_pred).^2));
+fprintf('Universal Kriging RMSE (with pop_density): %.3f\n', rmse_uk);
+
+%%
+
+%% Universal kriging using position and population density
+
+X_obs = [obs.Lon, obs.Lat, obs.pop_density];
+y_obs = obs.per_point_diff;
+
+trend_model = fitlm(X_obs, y_obs);
+
+X_pred = [pred.Lon, pred.Lat, pred.pop_density];
+trend_pred = predict(trend_model, X_pred);
+
+residuals_obs = y_obs - predict(trend_model, X_obs);
+
+
+vstruct = variogram(X_obs(:,1:2), residuals_obs, 'nrbins', 15);
+d = vstruct.distance;
+gamma = vstruct.val;
+
+[~, ~, ~, model] = variogramfit(d, gamma, max(d)/2, var(residuals_obs), [], 'model', 'gaussian');
+if isempty(model.nugget), model.nugget = 0.001; end
+
+
+Zresid_pred = ordinary_kriging_manual(X_obs(:,1:2), residuals_obs, X_pred(:,1:2), model);
+
+
+Zuk_pred = trend_pred + Zresid_pred;
+pred.uk_pred = Zuk_pred;
+
+rmse_uk = sqrt(mean((pred.per_point_diff - pred.uk_pred).^2));
+fprintf('Universal Kriging RMSE (with pop_density): %.3f\n', rmse_uk);
+
+
+%% Universal Kriging with covariates
+% Double check with column names in merged
+covariates_to_use = {'pop_density', 'Some_College', 'Unemployment', 'VoterTurnout', 'Child_Care_Cost_Burden','Severe_Housing_Cost_Burden', 'High_School_Grad'};
+
+%pred = full_kriging_model(merged, obs, pred, covariates_to_use, true, model); % with GLS
+pred = full_kriging_model(merged, obs, pred, covariates_to_use, false, model); % with OLS (fitlm)
+
+% True margins vs predicted margins
+true_vals = pred.per_point_diff;
+pred_vals = pred.kriging_pred;
+
+% Calculate RMSE
+rmse_final = sqrt(mean((true_vals - pred_vals).^2, 'omitnan'));
+
+fprintf('Full Model RMSE: %.4f\n', rmse_final);
+
+%% ALEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEX
+% BE
+
+%% Plot universal kriging with covariates
+% Create a side-by-side layout
+figure;
+t = tiledlayout(1,2,'TileSpacing','compact','Padding','compact');
+
+% Plot true margins
+nexttile;
+plot_margin_map(regionStates, election, obs, pred, 'per_point_diff', 'True Vote Margins');
+caxis([-1,1]);
+
+% Plot full kriging prediction
+nexttile;
+plot_margin_map(regionStates, election, obs, pred, 'kriging_pred', 'Full Model Kriging Prediction');
+caxis([-1,1]);
+
+colorbar;
+
+
+%% Kriging with external drift
+
+X_all = [merged.Lon, merged.Lat, merged.pop_density];
+y_all = merged.per_point_diff;
+
+% Fit global trend model using all known data
+ked_trend_model = fitlm(X_all, y_all);
+
+X_obs = [obs.Lon, obs.Lat, obs.pop_density];
+residuals_obs = obs.per_point_diff - predict(ked_trend_model, X_obs);
+
+X_pred = [pred.Lon, pred.Lat, pred.pop_density];
+ked_trend_pred = predict(ked_trend_model, X_pred);
+
+vstruct = variogram(X_obs(:,1:2), residuals_obs, 'nrbins', 15);
+d = vstruct.distance;
+gamma = vstruct.val;
+
+[~, ~, ~, ked_model] = variogramfit(d, gamma, max(d)/2, var(residuals_obs), [], 'model', 'gaussian');
+if isempty(ked_model.nugget), ked_model.nugget = 0.001; end
+
+Zresid_ked = ordinary_kriging_manual(X_obs(:,1:2), residuals_obs, X_pred(:,1:2), ked_model);
+
+pred.ked_pred = ked_trend_pred + Zresid_ked;
+
+rmse_ked = sqrt(mean((pred.per_point_diff - pred.ked_pred).^2));
+fprintf('Kriging with External Drift RMSE: %.3f\n', rmse_ked);
+
+%% Kriging but estimating trend with gls
+% 1. Prepare inputs
+X_obs = [ones(height(obs),1), obs.Lon, obs.Lat, obs.pop_density];
+y_obs = obs.per_point_diff;
+coords_obs = [obs.Lon, obs.Lat];
+
+X_pred = [ones(height(pred),1), pred.Lon, pred.Lat, pred.pop_density];
+
+% 2. Use your previously fitted variogram model (e.g., from residuals)
+[beta_gls, trend_gls_pred] = fitgls(X_obs, y_obs, coords_obs, X_pred, model);
+
+% 3. Continue with residual kriging as before
+residuals_gls = y_obs - X_obs * beta_gls;
+Zresid_gls = ordinary_kriging_manual(coords_obs, residuals_gls, [pred.Lon, pred.Lat], model);
+
+% 4. Final prediction
+pred.gls_pred = trend_gls_pred + Zresid_gls;
+
+%%
+methods = {'ok_pred', 'uk_pred', 'ked_pred', 'gls_pred'};
+for i = 1:length(methods)
+    rmse = sqrt(mean((pred.per_point_diff - pred.(methods{i})).^2));
+    fprintf('%s RMSE: %.3f\n', methods{i}, rmse);
+end
+
+
+
+%%
+
+figure;
+tiledlayout(1, 4, 'Padding', 'compact', 'TileSpacing', 'compact');
+
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'per_point_diff', 'Actual');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'ok_pred', 'Ordinary Kriging');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'uk_pred', 'Universal Kriging');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'ked_pred', 'Kriging w/ External Drift');
+
+
+%%
+
+figure;
+tiledlayout(1, 5, 'Padding', 'compact', 'TileSpacing', 'compact');
+
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'per_point_diff', 'Actual');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'ok_pred', 'Ordinary Kriging');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'uk_pred', 'Universal Kriging');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'ked_pred', 'Kriging w/ Drift');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'gls_pred', 'GLS Kriging');
+
+
+
+%%
+
+pred.ok_resid  = pred.per_point_diff - pred.ok_pred;
+pred.uk_resid  = pred.per_point_diff - pred.uk_pred;
+pred.ked_resid = pred.per_point_diff - pred.ked_pred;
+pred.gls_resid = pred.per_point_diff - pred.gls_pred;
+
+figure;
+t = tiledlayout(1,4, 'Padding', 'compact', 'TileSpacing', 'compact');
+
+climRange = [-0.5, 0.5];
+
+nexttile; plot_residual_map(regionStates, obs, pred, 'ok_resid', 'OK Residuals', climRange);
+nexttile; plot_residual_map(regionStates, obs, pred, 'uk_resid', 'UK Residuals', climRange);
+nexttile; plot_residual_map(regionStates, obs, pred, 'ked_resid', 'KED Residuals', climRange);
+nexttile; plot_residual_map(regionStates, obs, pred, 'gls_resid', 'GLSK Residuals', climRange);
+
+% Add shared colorbar
+colorbar;
+
+
+
+%%
+% Choose which residuals to analyze
+resid_name = 'uk_resid';  % <-- Change this to uk_resid, ked_resid, gls_resid
+
+resid_values = pred.(resid_name);
+coords_pred = [pred.Lon, pred.Lat];  % prediction coordinates
+
+% Remove NaNs
+valid = ~isnan(resid_values);
+resid_values = resid_values(valid);
+coords_pred = coords_pred(valid, :);
+
+%% 1. Histogram
+figure;
+histogram(resid_values, 'Normalization', 'pdf', 'BinWidth', 0.05);
+xlabel('Residual (Actual - Predicted)');
+ylabel('Density');
+title(sprintf('Histogram of Residuals (%s)', strrep(resid_name, '_', '\_')));
+grid on;
+
+%% 2. Mean and Std
+mean_resid = mean(resid_values);
+std_resid = std(resid_values);
+
+fprintf('Mean Residual (%s): %.4f\n', resid_name, mean_resid);
+fprintf('Std Dev of Residual (%s): %.4f\n', resid_name, std_resid);
+
+%% 3. Variogram of Residuals
+vstruct = variogram(coords_pred, resid_values, 'nrbins', 15);
+
+figure;
+plot(vstruct.distance, vstruct.val, 'o-');
+xlabel('Distance');
+ylabel('Semivariance');
+title(sprintf('Variogram of Residuals (%s)', strrep(resid_name, '_', '\_')));
+grid on;
+
+
+%%
+% Set up models to compare
+methods = {'ok_resid', 'uk_resid', 'ked_resid', 'gls_resid'};
+labels = {'Ordinary Kriging', 'Universal Kriging', 'Kriging w/ Drift', 'GLS Kriging'};
+colors = lines(length(methods));  % distinct colors
+
+figure;
+hold on;
+
+for i = 1:length(methods)
+    % Extract residuals
+    resid_values = pred.(methods{i});
+    coords_pred = [pred.Lon, pred.Lat];
+
+    % Remove NaNs
+    valid = ~isnan(resid_values);
+    resid_values = resid_values(valid);
+    coords_pred = coords_pred(valid, :);
+
+    % Compute empirical variogram
+    vstruct = variogram(coords_pred, resid_values, 'nrbins', 15);
+
+    % Plot
+    plot(vstruct.distance, vstruct.val, 'o-', 'Color', colors(i,:), 'DisplayName', labels{i});
+end
+
+xlabel('Distance');
+ylabel('Semivariance');
+title('Comparison of Residual Variograms');
+legend('Location', 'northwest');
+grid on;
+hold off;
+
+
+
+
 
 
 
