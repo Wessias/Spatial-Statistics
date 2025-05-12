@@ -627,12 +627,12 @@ title('Universal Kriging Prediction');
 
 figure;
 hold on;
-scatter(pred.per_point_diff, pred.uk_pred, 60, 'filled');
-scatter(pred.per_point_diff, pred.ok_pred, 60);
+scatter(pred.per_point_diff, pred.cov_pred, 60, 'filled');
+scatter(pred.per_point_diff, pred.cov_opt_pred, 60);
 hold off;
 xlabel('True Vote Margin');
 ylabel('Kriging Predicted Vote Margin');
-title('OK and UK: Predicted vs Actual Margins');
+title('Cov and Opt Cov: Predicted vs Actual Margins');
 grid on;
 axis equal;
 xlim([-1 1]);
@@ -719,14 +719,17 @@ fprintf('Universal Kriging RMSE (with pop_density): %.3f\n', rmse_uk);
 
 %% Universal Kriging with covariates
 % Double check with column names in merged
-covariates_to_use = {'pop_density', 'Some_College', 'Unemployment', 'VoterTurnout', 'Child_Care_Cost_Burden','Severe_Housing_Cost_Burden', 'High_School_Grad'};
-
-%pred = full_kriging_model(merged, obs, pred, covariates_to_use, true, model); % with GLS
-pred = full_kriging_model(merged, obs, pred, covariates_to_use, false, model); % with OLS (fitlm)
+%covariates_to_use = {'pop_density', 'Some_College', 'Unemployment', 'VoterTurnout', 'Child_Care_Cost_Burden','Severe_Housing_Cost_Burden', 'High_School_Grad'};
+covariates_to_use = {'pop_density', 'Some_College', 'Severe_Housing_Cost_Burden', 'Unemployment', 'VoterTurnout', 'High_School_Grad'};
+predCov = full_kriging_model(merged, obs, pred, covariates_to_use, true, model); % with GLS
+%predCov = full_kriging_model(merged, obs, pred, covariates_to_use, false, model); % with OLS (fitlm)
 
 % True margins vs predicted margins
-true_vals = pred.per_point_diff;
-pred_vals = pred.kriging_pred;
+true_vals = predCov.per_point_diff;
+pred_vals = predCov.kriging_pred;
+
+pred.cov_opt_pred = pred_vals;
+%pred.cov_pred = pred_vals;
 
 % Calculate RMSE
 rmse_final = sqrt(mean((true_vals - pred_vals).^2, 'omitnan'));
@@ -800,7 +803,7 @@ Zresid_gls = ordinary_kriging_manual(coords_obs, residuals_gls, [pred.Lon, pred.
 pred.gls_pred = trend_gls_pred + Zresid_gls;
 
 %%
-methods = {'ok_pred', 'uk_pred', 'ked_pred', 'gls_pred'};
+methods = {'ok_pred', 'uk_pred', 'ked_pred', 'gls_pred', 'kriging_pred'};
 for i = 1:length(methods)
     rmse = sqrt(mean((pred.per_point_diff - pred.(methods{i})).^2));
     fprintf('%s RMSE: %.3f\n', methods{i}, rmse);
@@ -824,11 +827,33 @@ nexttile; plot_margin_map(regionStates, election, obs, pred, 'ked_pred', 'Krigin
 figure;
 tiledlayout(1, 5, 'Padding', 'compact', 'TileSpacing', 'compact');
 
-nexttile; plot_margin_map(regionStates, election, obs, pred, 'per_point_diff', 'Actual');
-nexttile; plot_margin_map(regionStates, election, obs, pred, 'ok_pred', 'Ordinary Kriging');
-nexttile; plot_margin_map(regionStates, election, obs, pred, 'uk_pred', 'Universal Kriging');
-nexttile; plot_margin_map(regionStates, election, obs, pred, 'ked_pred', 'Kriging w/ Drift');
-nexttile; plot_margin_map(regionStates, election, obs, pred, 'gls_pred', 'GLS Kriging');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'per_point_diff', 'Real');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'ok_pred', 'OK');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'uk_pred', 'UK - Spatial Trend');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'cov_pred', 'UK - Spatial + All Thematic');
+nexttile; plot_margin_map(regionStates, election, obs, pred, 'cov_opt_pred', 'UK - Forward Selection');
+colorbar;
+
+%%
+figure;
+t = tiledlayout(2, 4, 'Padding', 'compact', 'TileSpacing', 'compact');
+
+% Top Row - Single Central Tile for Real Margins
+ax1 = nexttile([1, 4]); 
+plot_margin_map(regionStates, election, obs, pred, 'per_point_diff', 'Real Margins');
+
+% Bottom Row - 4 Prediction Models
+ax2 = nexttile; plot_margin_map(regionStates, election, obs, pred, 'ok_pred', 'OK');
+ax3 = nexttile; plot_margin_map(regionStates, election, obs, pred, 'uk_pred', 'UK - Spatial');
+ax4 = nexttile; plot_margin_map(regionStates, election, obs, pred, 'cov_pred', 'UK - Spatial + All Thematic');
+ax5 = nexttile; plot_margin_map(regionStates, election, obs, pred, 'cov_opt_pred', 'UK - Forward Selection');
+
+% Shared colorbar linked to the last axis
+cb = colorbar(ax1);
+cb.Label.String = 'Vote Margin (Republican - Democratic)';
+cb.Limits = [-1, 1];
+
+
 
 
 
@@ -836,11 +861,13 @@ nexttile; plot_margin_map(regionStates, election, obs, pred, 'gls_pred', 'GLS Kr
 
 pred.ok_resid  = pred.per_point_diff - pred.ok_pred;
 pred.uk_resid  = pred.per_point_diff - pred.uk_pred;
-pred.ked_resid = pred.per_point_diff - pred.ked_pred;
-pred.gls_resid = pred.per_point_diff - pred.gls_pred;
-
+%pred.ked_resid = pred.per_point_diff - pred.ked_pred;
+%pred.gls_resid = pred.per_point_diff - pred.gls_pred;
+pred.cov_opt_resid = pred.per_point_diff - pred.cov_opt_pred;
+pred.cov_resid = pred.per_point_diff - pred.cov_pred;
+%%
 figure;
-t = tiledlayout(1,4, 'Padding', 'compact', 'TileSpacing', 'compact');
+t = tiledlayout(1,5, 'Padding', 'compact', 'TileSpacing', 'compact');
 
 climRange = [-0.5, 0.5];
 
@@ -848,6 +875,7 @@ nexttile; plot_residual_map(regionStates, obs, pred, 'ok_resid', 'OK Residuals',
 nexttile; plot_residual_map(regionStates, obs, pred, 'uk_resid', 'UK Residuals', climRange);
 nexttile; plot_residual_map(regionStates, obs, pred, 'ked_resid', 'KED Residuals', climRange);
 nexttile; plot_residual_map(regionStates, obs, pred, 'gls_resid', 'GLSK Residuals', climRange);
+nexttile; plot_residual_map(regionStates, obs, pred, 'cov_resid', 'Cov UK Residuals', climRange);
 
 % Add shared colorbar
 colorbar;
@@ -856,7 +884,7 @@ colorbar;
 
 %%
 % Choose which residuals to analyze
-resid_name = 'uk_resid';  % <-- Change this to uk_resid, ked_resid, gls_resid
+resid_name = 'cov_opt_resid';  % <-- Change this to uk_resid, ked_resid, gls_resid
 
 resid_values = pred.(resid_name);
 coords_pred = [pred.Lon, pred.Lat];  % prediction coordinates
@@ -871,7 +899,7 @@ figure;
 histogram(resid_values, 'Normalization', 'pdf', 'BinWidth', 0.05);
 xlabel('Residual (Actual - Predicted)');
 ylabel('Density');
-title(sprintf('Histogram of Residuals (%s)', strrep(resid_name, '_', '\_')));
+title(sprintf('Histogram of Residuals (Optimal Covariate Model)', strrep(resid_name, '_', '\_')));
 grid on;
 
 %% 2. Mean and Std
@@ -888,14 +916,14 @@ figure;
 plot(vstruct.distance, vstruct.val, 'o-');
 xlabel('Distance');
 ylabel('Semivariance');
-title(sprintf('Variogram of Residuals (%s)', strrep(resid_name, '_', '\_')));
+title(sprintf('Variogram of Residuals (Full Covariate Model)', strrep(resid_name, '_', '\_')));
 grid on;
 
 
 %%
 % Set up models to compare
-methods = {'ok_resid', 'uk_resid', 'ked_resid', 'gls_resid'};
-labels = {'Ordinary Kriging', 'Universal Kriging', 'Kriging w/ Drift', 'GLS Kriging'};
+methods = {'ok_resid', 'uk_resid', 'cov_resid', 'cov_opt_resid'};
+labels = {'OK', 'UK - Spatial Trend', 'UK - Spatial + All Thematic', 'UK - Forward Selection'};
 colors = lines(length(methods));  % distinct colors
 
 figure;
